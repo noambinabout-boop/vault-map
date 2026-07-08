@@ -1,0 +1,3 @@
+# vault-map — dépendances (installer dans le venv : `uv pip install -r requirements.txt`)
+# Le moteur (vault_map.py) est en pur Python stdlib : SEUL le serveur MCP a une dépendance.
+mcp==1.28.1
