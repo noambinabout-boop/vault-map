@@ -11,7 +11,7 @@ Outils (V1 = 80 % de la valeur, cf. note d'idée) :
   index(path)               -> (re)cible le serveur sur un autre vault/dossier
 
 Cible (TARGET) :
-  - par défaut = le vault second_cerveau (VAULT par défaut ci-dessous),
+  - par défaut = le dossier de travail courant,
     surchargeable au lancement par VAULT_MAP_TARGET, ou à la volée par index(path).
 
 Fraîcheur : le graphe est reconstruit dès qu'une note change (signature = mtime+taille
@@ -19,13 +19,16 @@ agrégés du vault), sinon réutilisé. Sur ~50 notes le parse est négligeable 
 gratuit, jamais d'outline périmé (un outline qui ment est pire qu'un Read honnête).
 """
 import os
+import re
 
 from mcp.server.fastmcp import FastMCP
 
 import vault_map as vm
 
-# vault par défaut = le second cerveau de Noam
-DEFAULT_VAULT = r"c:\Users\Noam\Desktop\Noam\obsidian\second_cerveau"
+# Vault par défaut = le dossier courant. Pour pointer TOUJOURS le même vault quel que
+# soit le projet où Claude est lancé, définir VAULT_MAP_TARGET dans la config du serveur
+# MCP (cf. README) — sinon, index(path) recible à la volée.
+DEFAULT_VAULT = os.getcwd()
 
 mcp = FastMCP("vault-map")
 
@@ -79,6 +82,17 @@ def _fm_tag(fm):
     return f" [{'  '.join(parts)}]" if parts else ""
 
 
+def _enclosing_heading(headings, lineno):
+    """Le titre le plus SPÉCIFIQUE dont la plage [line, end_line] contient lineno
+    (= la plus grande `line` qui englobe le hit -> la section H3 l'emporte sur son H2
+    parent). None si le hit est au-dessus de tout titre (frontmatter / chapô)."""
+    best = None
+    for h in headings:
+        if h["line"] <= lineno <= h["end_line"] and (best is None or h["line"] > best["line"]):
+            best = h
+    return best
+
+
 @mcp.tool()
 def index(path: str) -> str:
     """(Re)cible le serveur sur un vault / dossier de notes .md et construit sa carte.
@@ -93,7 +107,7 @@ def index(path: str) -> str:
     if n == 0:
         return f"Ciblé sur {STATE['target']}, mais aucune note .md trouvée."
     return (f"Ciblé sur {STATE['target']} : {n} notes indexées. "
-            f"Outils prêts (vault_map / outline / get_section / query).")
+            f"Outils prêts (vault_map / outline / get_section / query / grep_notes).")
 
 
 @mcp.tool()
@@ -167,6 +181,46 @@ def get_section(note: str, title: str) -> str:
         lines = fh.readlines()
     body = lines[h["line"] - 1: h["end_line"]]
     return f"# {rel}:{h['line']}-{h['end_line']}\n" + "".join(body)
+
+
+@mcp.tool()
+def grep_notes(pattern: str, max_results: int = 40) -> str:
+    """Recherche par CONTENU (regex, insensible à la casse) dans le TEXTE des notes,
+    chaque hit SITUÉ dans sa note ET sa section englobante. Complément de query (qui
+    filtre le frontmatter) et d'outline (qui ne rend que les titres) : à utiliser pour
+    retrouver un littéral, une phrase, un [[lien]], un mot précis — là où la structure
+    ne suffit pas. Rend « note › section (Ln) : ligne », ce qui situe le hit au lieu
+    d'une ligne nue (remplace le Grep brut sur le vault)."""
+    g = _graph()
+    if not g["notes"]:
+        return f"Aucune note dans {STATE['target']}."
+    try:
+        rx = re.compile(pattern, re.IGNORECASE)
+    except re.error as e:
+        return f"Regex invalide : {e}"
+    out = []
+    n = 0
+    for rel in sorted(g["notes"]):
+        d = g["notes"][rel]
+        path = os.path.join(STATE["target"], rel)
+        try:
+            with open(path, "r", encoding="utf-8", errors="replace") as fh:
+                lines = fh.readlines()
+        except OSError:
+            continue
+        for i, line in enumerate(lines, start=1):
+            if rx.search(line):
+                h = _enclosing_heading(d["headings"], i)
+                loc = _short(h["title"]) if h else "(chapô)"
+                out.append(f"  {d['name']} › {loc} (L{i}):  {line.strip()}")
+                n += 1
+                if n >= max_results:
+                    out.append(f"  … (coupé à {max_results} ; affine le motif)")
+                    return f"# grep_notes(/{pattern}/) — {n}+ résultats\n" + "\n".join(out)
+    if not n:
+        return (f"Aucune correspondance pour /{pattern}/ dans {STATE['target']} "
+                f"({len(g['notes'])} notes .md).")
+    return f"# grep_notes(/{pattern}/) — {n} résultat(s)\n" + "\n".join(out)
 
 
 @mcp.tool()
