@@ -18,6 +18,26 @@ import re
 
 EXCLUDE_DIRS = {".obsidian", ".claude", ".trash", ".git", "node_modules"}
 
+# Dossiers ignorés EN PLUS quand la cible est un repo de CODE : dépendances, artefacts
+# de build, caches. Sans eux, indexer un repo ramène les .md des dépendances (des
+# milliers) et noie les cinq docs qu'on cherchait.
+CODE_EXCLUDE_DIRS = {
+    ".venv", "venv", "env", "virtualenv", "site-packages", "__pycache__",
+    ".tox", ".nox", ".mypy_cache", ".pytest_cache", ".ruff_cache", ".cache",
+    "htmlcov", "coverage", "dist", "build", "out", "target", "bin", "obj",
+    "vendor", "Pods", "bower_components", ".pnpm-store",
+    ".next", ".nuxt", ".svelte-kit", ".astro", ".output", "storybook-static",
+    ".gradle", ".terraform", ".idea", ".vscode",
+}
+
+# Manifestes qui trahissent un repo de code (et non un vault de notes). `.git` ne peut
+# PAS servir de marqueur : un vault Obsidian est souvent versionné lui aussi.
+CODE_MARKERS = {
+    "package.json", "pyproject.toml", "setup.py", "setup.cfg", "requirements.txt",
+    "go.mod", "cargo.toml", "pom.xml", "build.gradle", "composer.json", "gemfile",
+    "tsconfig.json", "makefile", "cmakelists.txt", "pubspec.yaml", "mix.exs",
+}
+
 # capture la cible d'un [[lien]] (avant | ou #) — identique à cerveau-viz/build_graph.py
 LINK_RE = re.compile(r"\[\[([^\]|#]+)")
 # faux liens = exemples génériques cités dans du texte (ex. le CLAUDE.md), pas de vraies cibles
@@ -25,6 +45,9 @@ _FAKE_LINKS = {"liens", "lien", "…", "...", "lien", "nom", "name", "their-name
 # un titre markdown : niveau (nb de #) + texte. On rejette les # collés (pas d'espace).
 HEADING_RE = re.compile(r"^(#{1,6})\s+(.*\S)\s*$")
 FENCE_RE = re.compile(r"^\s*(```|~~~)")
+# code inline `…` : y chercher des [[liens]] n'a pas de sens (du JSON `[["a","b"]]`
+# dans un README n'est pas un wikilink). Écarté avant l'extraction des liens.
+INLINE_CODE_RE = re.compile(r"`[^`]*`")
 
 
 def norm(p):
@@ -59,6 +82,23 @@ def parse_note(path):
     fm, body_start = _parse_frontmatter(lines)
 
     headings = []
+    links = []
+    seen = set()
+
+    def collect_links(raw):
+        """Liens d'une ligne, dédupliqués, dans l'ordre d'apparition."""
+        for lm in LINK_RE.finditer(INLINE_CODE_RE.sub(" ", raw)):
+            t = lm.group(1).strip()
+            low = t.lower()
+            if t and low not in seen and low not in _FAKE_LINKS:
+                seen.add(low)
+                links.append(t)
+
+    # le frontmatter porte de vrais liens (`parent: "[[X]]"`, à la Dataview) et ne
+    # peut pas contenir de bloc de code : on le scanne tel quel.
+    for i in range(body_start):
+        collect_links(lines[i])
+
     in_fence = False
     for i in range(body_start, n):
         raw = lines[i]
@@ -67,6 +107,9 @@ def parse_note(path):
             continue
         if in_fence:
             continue
+        # hors blocs de code seulement : dans un README de repo, `[["a","b"]]` est du
+        # JSON, pas un wikilink — le compter salirait la carte (et un futur backlink).
+        collect_links(raw)
         m = HEADING_RE.match(raw)
         if m:
             headings.append({
@@ -85,41 +128,65 @@ def parse_note(path):
                 break
         h["end_line"] = end
 
-    links = []
-    seen = set()
-    for m in LINK_RE.finditer("".join(lines)):
-        t = m.group(1).strip()
-        low = t.lower()
-        if t and low not in seen and low not in _FAKE_LINKS:
-            seen.add(low)
-            links.append(t)
-
     return {"frontmatter": fm, "headings": headings, "links": links, "lines": n}
 
 
+def detect_mode(root):
+    """« repo » si la racine porte un manifeste de code, « vault » sinon.
+    Détermine les dossiers à ignorer et la façon de rendre la carte."""
+    try:
+        names = {n.lower() for n in os.listdir(root)}
+    except OSError:
+        return "vault"
+    return "repo" if names & CODE_MARKERS else "vault"
+
+
+def exclude_dirs(mode):
+    """Les dossiers à sauter pour ce mode."""
+    return EXCLUDE_DIRS | CODE_EXCLUDE_DIRS if mode == "repo" else EXCLUDE_DIRS
+
+
+def iter_md(root, mode=None):
+    """Parcourt les .md sous root -> (chemin absolu, chemin relatif POSIX).
+    Source unique du périmètre : build() et la signature de fraîcheur passent par
+    ici, donc ils ne peuvent pas diverger sur ce qui est indexé."""
+    if mode is None:
+        mode = detect_mode(root)
+    skip = exclude_dirs(mode)
+    for dirpath, dirs, names in os.walk(root):
+        dirs[:] = [d for d in dirs if d not in skip]
+        for fn in names:
+            if fn.lower().endswith(".md"):
+                path = os.path.join(dirpath, fn)
+                yield path, os.path.relpath(path, root).replace("\\", "/")
+
+
 def build(vault):
-    """Scanne le vault, parse chaque .md -> index requêtable.
-    { vault, notes: {rel -> {name, folder, frontmatter, headings, links, lines}},
+    """Scanne la cible, parse chaque .md -> index requêtable.
+    { vault, mode, notes: {rel -> {name, folder, frontmatter, headings, links, lines}},
       by_name: {name_lower -> [rel, …]} }"""
     vault = os.path.abspath(vault)
+    mode = detect_mode(vault)
     notes = {}
     by_name = {}
-    for root, dirs, names in os.walk(vault):
-        dirs[:] = [d for d in dirs if d not in EXCLUDE_DIRS]
-        for fn in names:
-            if not fn.lower().endswith(".md"):
-                continue
-            path = os.path.join(root, fn)
-            rel = os.path.relpath(path, vault).replace("\\", "/")
-            name = os.path.splitext(fn)[0]
-            folder = rel.split("/")[0] if "/" in rel else "(racine)"
-            try:
-                parsed = parse_note(path)
-            except OSError:
-                continue
-            notes[rel] = {"name": name, "folder": folder, **parsed}
-            by_name.setdefault(name.lower(), []).append(rel)
-    return {"vault": vault, "notes": notes, "by_name": by_name}
+    for path, rel in iter_md(vault, mode):
+        name = os.path.splitext(os.path.basename(path))[0]
+        # vault : dossier de 1er niveau (= le dossier PARA, ce qui structure la carte).
+        # repo  : dossier parent complet, sinon tous les README de packages/*/ se
+        #         retrouvent dans un même sac « packages » sans se distinguer.
+        if "/" not in rel:
+            folder = "(racine)"
+        elif mode == "repo":
+            folder = rel.rsplit("/", 1)[0]
+        else:
+            folder = rel.split("/", 1)[0]
+        try:
+            parsed = parse_note(path)
+        except OSError:
+            continue
+        notes[rel] = {"name": name, "folder": folder, **parsed}
+        by_name.setdefault(name.lower(), []).append(rel)
+    return {"vault": vault, "mode": mode, "notes": notes, "by_name": by_name}
 
 
 def resolve(graph, ref):

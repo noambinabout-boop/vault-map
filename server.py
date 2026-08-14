@@ -13,6 +13,12 @@ Outils (V1 = 80 % de la valeur, cf. note d'idée) :
 Cible (TARGET) :
   - par défaut = le dossier de travail courant,
     surchargeable au lancement par VAULT_MAP_TARGET, ou à la volée par index(path).
+  - chaque outil accepte en plus un `path=` : il répond sur CE dossier pour l'appel,
+    sans changer la cible. Sert à lire les .md d'un repo de code (README, docs/, ADR
+    — le « pourquoi » qu'un repo-map ne voit pas) sans perdre le vault. Chaque cible
+    interrogée garde son graphe en cache, donc l'aller-retour est gratuit.
+  - un repo de code est reconnu à ses manifestes (package.json, pyproject.toml…) :
+    dépendances, artefacts de build et caches sont alors ignorés.
 
 Fraîcheur : le graphe est reconstruit dès qu'une note change (signature = mtime+taille
 agrégés du vault), sinon réutilisé. Sur ~50 notes le parse est négligeable -> anti-désync
@@ -20,6 +26,7 @@ gratuit, jamais d'outline périmé (un outline qui ment est pire qu'un Read honn
 """
 import os
 import re
+from typing import Optional
 
 from mcp.server.fastmcp import FastMCP
 
@@ -34,33 +41,51 @@ mcp = FastMCP("vault-map")
 
 STATE = {
     "target": os.path.abspath(os.environ.get("VAULT_MAP_TARGET") or DEFAULT_VAULT),
-    "graph": None,
-    "sig": None,
+    # Une cible interrogée reste en cache : consulter les docs d'un repo ne coûte
+    # donc pas la reconstruction du vault au retour.
+    "cache": {},  # chemin absolu -> {"graph": …, "sig": …}
 }
 
 
-def _signature(vault):
-    """Empreinte du vault = somme (mtime, taille) des .md. Change => rebuild."""
+def _signature(target, mode=None):
+    """Empreinte de la cible = somme (mtime, taille) de ses .md. Change => rebuild.
+    Même périmètre que build() (vm.iter_md) : la fraîcheur ne peut pas se calculer
+    sur un ensemble de fichiers différent de celui qui est indexé."""
     total = 0.0
-    for root, dirs, names in os.walk(vault):
-        dirs[:] = [d for d in dirs if d not in vm.EXCLUDE_DIRS]
-        for fn in names:
-            if fn.lower().endswith(".md"):
-                try:
-                    st = os.stat(os.path.join(root, fn))
-                    total += st.st_mtime + st.st_size
-                except OSError:
-                    pass
+    for path, _rel in vm.iter_md(target, mode):
+        try:
+            st = os.stat(path)
+            total += st.st_mtime + st.st_size
+        except OSError:
+            pass
     return total
 
 
-def _graph():
-    """Graphe courant, (re)construit si le vault a changé depuis le dernier appel."""
-    sig = _signature(STATE["target"])
-    if STATE["graph"] is None or sig != STATE["sig"]:
-        STATE["graph"] = vm.build(STATE["target"])
-        STATE["sig"] = sig
-    return STATE["graph"]
+def _resolve_target(path=None):
+    """La cible de CET appel : `path` s'il est fourni, sinon la cible courante."""
+    if not path:
+        return STATE["target"]
+    return os.path.abspath(os.path.expanduser(path))
+
+
+def _graph(path=None):
+    """Graphe de la cible demandée, (re)construit seulement si elle a changé."""
+    target = _resolve_target(path)
+    sig = _signature(target)
+    slot = STATE["cache"].get(target)
+    if slot is None or slot["sig"] != sig:
+        slot = {"graph": vm.build(target), "sig": sig}
+        STATE["cache"][target] = slot
+    return slot["graph"]
+
+
+def _open(path=None):
+    """(graphe, None) pour la cible de cet appel, ou (None, message d'erreur)."""
+    target = _resolve_target(path)
+    if not os.path.isdir(target):
+        return None, (f"Dossier introuvable : {target}\n"
+                      f"(cible courante : {STATE['target']})")
+    return _graph(target), None
 
 
 def _short(title, n=42):
@@ -82,6 +107,11 @@ def _fm_tag(fm):
     return f" [{'  '.join(parts)}]" if parts else ""
 
 
+def _count(n):
+    """« 1 fichier .md » / « 12 fichiers .md »."""
+    return f"{n} fichier{'s' if n > 1 else ''} .md"
+
+
 def _enclosing_heading(headings, lineno):
     """Le titre le plus SPÉCIFIQUE dont la plage [line, end_line] contient lineno
     (= la plus grande `line` qui englobe le hit -> la section H3 l'emporte sur son H2
@@ -95,33 +125,41 @@ def _enclosing_heading(headings, lineno):
 
 @mcp.tool()
 def index(path: str) -> str:
-    """(Re)cible le serveur sur un vault / dossier de notes .md et construit sa carte.
-    Utile pour pointer un autre vault que celui par défaut. Les autres outils opèrent
-    ensuite sur ce dossier."""
+    """(Re)cible DURABLEMENT le serveur sur un vault / dossier de notes .md.
+    Pour seulement consulter les docs d'un repo au passage, ne recible PAS : passe
+    `path=` à l'outil voulu (vault_map, grep_notes, outline…), la cible courante est
+    conservée. `index` sert à changer de vault pour toute la suite de la session."""
     if not os.path.isdir(path):
         return f"Dossier introuvable : {path}"
-    STATE["target"] = os.path.abspath(path)
-    STATE["graph"] = None
+    STATE["target"] = os.path.abspath(os.path.expanduser(path))
     g = _graph()
     n = len(g["notes"])
     if n == 0:
-        return f"Ciblé sur {STATE['target']}, mais aucune note .md trouvée."
-    return (f"Ciblé sur {STATE['target']} : {n} notes indexées. "
+        return f"Ciblé sur {STATE['target']}, mais aucun fichier .md trouvé."
+    kind = ("repo de code : dépendances, build et caches ignorés"
+            if g["mode"] == "repo" else "vault de notes")
+    return (f"Ciblé sur {STATE['target']} : {_count(n)} indexés ({kind}). "
             f"Outils prêts (vault_map / outline / get_section / query / grep_notes).")
 
 
 @mcp.tool()
-def vault_map() -> str:
+def vault_map(path: Optional[str] = None) -> str:
     """Carte d'ensemble du vault : pour chaque note, son dossier PARA, son frontmatter
     clé (status/score/next_review), ses titres H2 et ses liens sortants. À appeler EN
-    PREMIER pour t'orienter : ~1-2k tokens pour TOUT le vault au lieu d'ouvrir 10 notes."""
-    g = _graph()
+    PREMIER pour t'orienter : ~1-2k tokens pour TOUT le vault au lieu d'ouvrir 10 notes.
+    `path` (optionnel) : cartographier un AUTRE dossier pour ce seul appel, sans changer
+    la cible courante. Sur un repo de CODE, rend ses .md (README, docs/, ADR, CHANGELOG)
+    — le « pourquoi » du projet, que repo-map ne voit pas puisqu'il n'indexe que le code."""
+    g, err = _open(path)
+    if err:
+        return err
     if not g["notes"]:
-        return f"Aucune note dans {STATE['target']}."
+        return f"Aucun fichier .md dans {g['vault']}."
     by_folder = {}
     for rel, d in g["notes"].items():
         by_folder.setdefault(d["folder"], []).append((rel, d))
-    out = [f"# Carte du vault — {len(g['notes'])} notes ({STATE['target']})"]
+    label = "Carte des docs" if g["mode"] == "repo" else "Carte du vault"
+    out = [f"# {label} — {_count(len(g['notes']))} ({g['vault']})"]
     for folder in sorted(by_folder):
         out.append(f"\n## {folder}")
         for rel, d in sorted(by_folder[folder]):
@@ -139,11 +177,15 @@ def vault_map() -> str:
 
 
 @mcp.tool()
-def outline(note: str) -> str:
+def outline(note: str, path: Optional[str] = None) -> str:
     """Table des matières d'une note : arbre des titres (indenté par niveau) + n° de
     lignes de chaque section. À utiliser AVANT de lire une note : sur une note-monstre
-    (400+ lignes), ~95 % moins de tokens qu'un Read complet."""
-    g = _graph()
+    (400+ lignes), ~95 % moins de tokens qu'un Read complet.
+    `path` (optionnel) : chercher la note dans un AUTRE dossier pour ce seul appel
+    (ex. le README ou un ADR d'un repo), sans changer la cible courante."""
+    g, err = _open(path)
+    if err:
+        return err
     rel, err = vm.resolve(g, note)
     if err:
         return err
@@ -158,11 +200,15 @@ def outline(note: str) -> str:
 
 
 @mcp.tool()
-def get_section(note: str, title: str) -> str:
+def get_section(note: str, title: str, path: Optional[str] = None) -> str:
     """Le corps d'UNE section seulement (titre + contenu jusqu'au prochain titre de
     même niveau ou supérieur). À n'appeler que pour la section qui t'intéresse, jamais
-    pour t'orienter (pour ça : outline). `title` = sous-chaîne, insensible à la casse."""
-    g = _graph()
+    pour t'orienter (pour ça : outline). `title` = sous-chaîne, insensible à la casse.
+    `path` (optionnel) : lire la section d'un fichier d'un AUTRE dossier pour ce seul
+    appel (ex. la section « Install » du README d'un repo), sans changer la cible."""
+    g, err = _open(path)
+    if err:
+        return err
     rel, err = vm.resolve(g, note)
     if err:
         return err
@@ -176,24 +222,28 @@ def get_section(note: str, title: str) -> str:
         exact = [h for h in matches if h["title"].lower() == q]
         matches = exact or matches[:1]
     h = matches[0]
-    path = os.path.join(STATE["target"], rel)
-    with open(path, "r", encoding="utf-8", errors="replace") as fh:
+    full = os.path.join(g["vault"], rel)
+    with open(full, "r", encoding="utf-8", errors="replace") as fh:
         lines = fh.readlines()
     body = lines[h["line"] - 1: h["end_line"]]
     return f"# {rel}:{h['line']}-{h['end_line']}\n" + "".join(body)
 
 
 @mcp.tool()
-def grep_notes(pattern: str, max_results: int = 40) -> str:
+def grep_notes(pattern: str, max_results: int = 40, path: Optional[str] = None) -> str:
     """Recherche par CONTENU (regex, insensible à la casse) dans le TEXTE des notes,
     chaque hit SITUÉ dans sa note ET sa section englobante. Complément de query (qui
     filtre le frontmatter) et d'outline (qui ne rend que les titres) : à utiliser pour
     retrouver un littéral, une phrase, un [[lien]], un mot précis — là où la structure
     ne suffit pas. Rend « note › section (Ln) : ligne », ce qui situe le hit au lieu
-    d'une ligne nue (remplace le Grep brut sur le vault)."""
-    g = _graph()
+    d'une ligne nue (remplace le Grep brut sur le vault).
+    `path` (optionnel) : fouiller un AUTRE dossier pour ce seul appel, sans changer la
+    cible courante — sur un repo de code, cherche dans ses .md (README, docs/, ADR)."""
+    g, err = _open(path)
+    if err:
+        return err
     if not g["notes"]:
-        return f"Aucune note dans {STATE['target']}."
+        return f"Aucun fichier .md dans {g['vault']}."
     try:
         rx = re.compile(pattern, re.IGNORECASE)
     except re.error as e:
@@ -202,9 +252,9 @@ def grep_notes(pattern: str, max_results: int = 40) -> str:
     n = 0
     for rel in sorted(g["notes"]):
         d = g["notes"][rel]
-        path = os.path.join(STATE["target"], rel)
+        full = os.path.join(g["vault"], rel)
         try:
-            with open(path, "r", encoding="utf-8", errors="replace") as fh:
+            with open(full, "r", encoding="utf-8", errors="replace") as fh:
                 lines = fh.readlines()
         except OSError:
             continue
@@ -218,20 +268,24 @@ def grep_notes(pattern: str, max_results: int = 40) -> str:
                     out.append(f"  … (coupé à {max_results} ; affine le motif)")
                     return f"# grep_notes(/{pattern}/) — {n}+ résultats\n" + "\n".join(out)
     if not n:
-        return (f"Aucune correspondance pour /{pattern}/ dans {STATE['target']} "
-                f"({len(g['notes'])} notes .md).")
+        return (f"Aucune correspondance pour /{pattern}/ dans {g['vault']} "
+                f"({len(g['notes'])} fichiers .md).")
     return f"# grep_notes(/{pattern}/) — {n} résultat(s)\n" + "\n".join(out)
 
 
 @mcp.tool()
-def query(filter: str) -> str:
+def query(filter: str, path: Optional[str] = None) -> str:
     """Le "Dataview de Claude" : filtre les notes par frontmatter, sans ouvrir les notes.
     `filter` = une ou plusieurs clauses séparées par des virgules (toutes doivent matcher).
     Opérateurs : `:` (contient), `>` `<` `>=` `<=` (numérique/date).
     Pseudo-champs (pour chercher une note par son NOM) : `title:<mot>`, `path:<dossier>`.
     Clé inconnue -> erreur explicite listant les clés requêtables (pas un « aucune note »
-    trompeur). Ex : `status:challengee, score>5` ; `path:Repo-map` ; `title:vault`."""
-    g = _graph()
+    trompeur). Ex : `status:challengee, score>5` ; `path:Repo-map` ; `title:vault`.
+    (Le pseudo-champ `path:` filtre le chemin des notes ; l'argument `path`, lui, change
+    le dossier interrogé pour ce seul appel — sans changer la cible courante.)"""
+    g, err = _open(path)
+    if err:
+        return err
     clauses = [c for c in (x.strip() for x in filter.split(",")) if c]
     if not clauses:
         return "Filtre vide. Ex : status:go, score>=8"

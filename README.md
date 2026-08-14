@@ -28,6 +28,9 @@ instead of answering from memory.
 | `grep_notes(pattern)` | regex search through note *text*, each hit located as `note › section (Ln)` |
 | `index(path)` | (re)target the server at another vault / folder of `.md` files |
 
+Every tool also takes an optional `path=` argument: answer about **another folder for this
+one call**, without changing the current target (see *Reading a code repo's docs* below).
+
 `query` also understands two pseudo-fields for finding a note by name: `title:<word>` and
 `path:<folder>`.
 
@@ -83,6 +86,31 @@ By default the server targets the **current working directory**. Two ways to cha
 
 On Windows, `PYTHONIOENCODING: utf-8` avoids a crash when a note contains an emoji.
 
+### Reading a code repo's docs
+
+A repository's `.md` files — `README`, `docs/`, ADRs, `CHANGELOG` — hold the *why* of a
+project: decisions, trade-offs, gotchas. A code map like repo-map cannot see any of it; it
+only parses source. Point vault-map at a repo and you get that layer back:
+
+```python
+vault_map(path="/path/to/repo")            # every doc in the repo, one screen
+grep_notes("rate limit", path="/path/to/repo")
+get_section("README", "Install", path="/path/to/repo")
+```
+
+Two things make this usable rather than merely possible:
+
+- **Your vault stays targeted.** `path=` applies to that call only, and each folder keeps
+  its own cached map, so hopping between vault and repo costs nothing. Use `index()` only
+  when you want to *move* for the rest of the session.
+- **Build output is skipped.** A folder holding a manifest (`package.json`,
+  `pyproject.toml`, `go.mod`, `Cargo.toml`…) is treated as a code repo: dependencies and
+  build artefacts (`.venv`, `site-packages`, `dist`, `build`, `target`, `vendor`, `.next`,
+  caches…) are excluded. Without that, the docs you wanted drown in the ones you didn't —
+  on this very repo, indexing naively returns 7 files, 6 of them from `.venv`.
+
+`.git` alone is deliberately *not* the signal: plenty of vaults are version-controlled too.
+
 ### Make the agent actually use it
 
 Tools nobody calls save nothing. Put the reflex in your `CLAUDE.md` (or equivalent):
@@ -93,6 +121,7 @@ To find your way around the vault, use vault-map, not Read:
 2. outline(note) before opening any note
 3. get_section(note, title) to read only the part that matters
 4. grep_notes(pattern) to search by content
+5. any tool with path="/path/to/repo" to read that repo's docs, without losing the vault
 Raw Grep/Read: last resort only.
 ```
 
