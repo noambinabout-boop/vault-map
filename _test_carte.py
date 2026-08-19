@@ -63,12 +63,16 @@ verifie(("entrées :" in defaut) == (plate > server.BUDGET_DEFAUT),
         "bascule détail/résumé cohérente avec le poids réel du vault")
 
 # 2. RIEN DE PERDU — borner la sortie ne doit rendre aucune note injoignable.
-# Les notes posées à la racine n'ont pas de chemin de dossier : elles se lisent dans la
-# vue exhaustive, pas par un folder= (« (racine) » est une étiquette, pas un dossier).
-racine = sum(1 for d in g["notes"].values() if d["folder"] == "(racine)")
-vues = racine + sum(sum(1 for l in carte(folder=f, budget=0).splitlines() if l.startswith("- "))
-                    for f in DOSSIERS if f != "(racine)")
-verifie(vues == TOTAL, f"toutes les notes joignables via folder= : {vues}/{TOTAL}")
+# Note par note, jamais en sommant les dossiers : depuis que le zoom est récursif, un
+# dossier parent contient aussi ses enfants, donc une somme compte deux fois.
+# Les notes de la racine n'ont pas de dossier : elles se lisent dans la vue exhaustive.
+_zoom = {f: carte(folder=f, budget=0) for f in TOUS_DOSSIERS}
+_exhaustive = carte(budget=0)
+introuvables = [rel for rel, d in g["notes"].items()
+                if f"- {d['name']} (" not in _zoom.get(rel.rsplit("/", 1)[0], _exhaustive)]
+verifie(not introuvables,
+        f"chaque note joignable par le zoom de son dossier : {TOTAL - len(introuvables)}/{TOTAL}"
+        + (f" — introuvables : {introuvables[:3]}" if introuvables else ""))
 verifie(len(carte(budget=0)) > len(defaut) or TOTAL < 20,
         "budget=0 rend bien la vue exhaustive")
 

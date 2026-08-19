@@ -150,7 +150,7 @@ def _ligne_note(d):
     return line
 
 
-def _tenir_budget(items, budget, poids, reserve=0):
+def _tenir_budget(items, budget, poids, reserve=0, forcer_un=True):
     """Garde le début de `items` (déjà trié par importance) qui tient dans `budget`.
     Rend (gardés, nb_omis). budget=0 -> tout. `reserve` = place gardée pour l'en-tête et
     la ligne de troncature, pour que le budget borne la sortie ENTIÈRE et pas seulement
@@ -162,7 +162,10 @@ def _tenir_budget(items, budget, poids, reserve=0):
     gardes, taille = [], max(0, reserve)
     for it in items:
         c = poids(it)
-        if taille + c > budget and gardes:
+        # `forcer_un` : mieux vaut une ligne qui deborde qu'une carte vide, pour la liste
+        # PRINCIPALE. Pour un bloc secondaire (les notes directes d'un resume), non : le
+        # bloc principal a deja consomme le budget, forcer ferait sauter le plafond.
+        if taille + c > budget and (gardes or not forcer_un):
             break
         gardes.append(it)
         taille += c
@@ -257,7 +260,7 @@ def _carte_resume(g, base, label, budget):
         lignes = {rel: _ligne_note(d) for rel, d in directes}
         vus, coupes = _tenir_budget(
             sorted(directes, key=lambda rd: (-ent.get(rd[0], 0), rd[0])),
-            max(reste, 0), lambda rd: len(lignes[rd[0]]) + 1)
+            max(reste, 0), lambda rd: len(lignes[rd[0]]) + 1, forcer_un=False)
         if vus:
             out.append(f"\n## {base or '(racine)'} — {_notes(len(directes))}")
             out += [lignes[rel] for rel, _ in sorted(vus, key=lambda rd: rd[0])]
