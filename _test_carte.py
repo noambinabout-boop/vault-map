@@ -25,7 +25,8 @@ server.STATE.update(target=os.path.abspath(VAULT),
                     cache={os.path.abspath(VAULT): {"graph": g, "sig": 1}})
 carte = getattr(server.vault_map, "fn", server.vault_map)
 
-DOSSIERS = sorted({d["folder"] for d in g["notes"].values()})
+DOSSIERS = sorted({d["folder"] for d in g["notes"].values()})   # 1er niveau : couverture
+TOUS_DOSSIERS = server._dossiers(g)                              # toute profondeur : bornage
 TOTAL = len(g["notes"])
 echecs = []
 
@@ -48,14 +49,25 @@ for b in (1500, 3000, server.BUDGET_DEFAUT, 20000):
     n = len(carte(folder=gros, budget=b))
     verifie(n <= b, f"zoom « {gros} » borné à budget={b} : {n} car")
 
+# Le plafond doit tenir sur TOUS les dossiers, pas seulement le plus lourd : un dossier
+# mêlant beaucoup de notes directes ET des sous-dossiers est le cas qui déborde le plus
+# facilement (les deux blocs s'additionnent).
+debordent = [(f, len(carte(folder=f)))
+             for f in TOUS_DOSSIERS if len(carte(folder=f)) > server.BUDGET_DEFAUT]
+verifie(not debordent, f"tous les dossiers bornés au budget par défaut ({len(TOUS_DOSSIERS)} testés, sous-dossiers compris)"
+                       + (f" — débordent : {debordent}" if debordent else ""))
+
 # La bascule est adaptative : le détail tant qu'il rentre, le résumé au-delà.
 plate = len(carte(budget=0))
 verifie(("entrées :" in defaut) == (plate > server.BUDGET_DEFAUT),
         "bascule détail/résumé cohérente avec le poids réel du vault")
 
 # 2. RIEN DE PERDU — borner la sortie ne doit rendre aucune note injoignable.
-vues = sum(sum(1 for l in carte(folder=f, budget=0).splitlines() if l.startswith("- "))
-           for f in DOSSIERS)
+# Les notes posées à la racine n'ont pas de chemin de dossier : elles se lisent dans la
+# vue exhaustive, pas par un folder= (« (racine) » est une étiquette, pas un dossier).
+racine = sum(1 for d in g["notes"].values() if d["folder"] == "(racine)")
+vues = racine + sum(sum(1 for l in carte(folder=f, budget=0).splitlines() if l.startswith("- "))
+                    for f in DOSSIERS if f != "(racine)")
 verifie(vues == TOTAL, f"toutes les notes joignables via folder= : {vues}/{TOTAL}")
 verifie(len(carte(budget=0)) > len(defaut) or TOTAL < 20,
         "budget=0 rend bien la vue exhaustive")
