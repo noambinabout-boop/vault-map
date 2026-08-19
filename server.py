@@ -4,7 +4,8 @@ La FAÇADE : expose à Claude les outils pour s'orienter dans un vault Obsidian
 SANS lire les notes entières. Le pendant markdown de repo-map (code).
 
 Outils (V1 = 80 % de la valeur, cf. note d'idée) :
-  vault_map()               -> carte d'ensemble du vault (dossier, frontmatter, H2, liens)
+  vault_map()               -> carte des dossiers + leurs notes-hub (coût borné)
+  vault_map(folder=…)       -> zoom sur un dossier (frontmatter, H2, liens de chaque note)
   outline(note)             -> arbre des titres d'une note + n° de lignes
   get_section(note, titre)  -> le corps d'UNE section seulement
   query(filter)             -> le "Dataview de Claude" : filtre les notes par frontmatter
@@ -107,9 +108,104 @@ def _fm_tag(fm):
     return f" [{'  '.join(parts)}]" if parts else ""
 
 
+def _notes(n):
+    """« 1 note » / « 12 notes » — un rapport qui écrit « 1 notes » se relit mal."""
+    return f"{n} note{'s' if n > 1 else ''}"
+
+
 def _count(n):
     """« 1 fichier .md » / « 12 fichiers .md »."""
     return f"{n} fichier{'s' if n > 1 else ''} .md"
+
+
+BUDGET_DEFAUT = 6000  # caractères ≈ 1,7k tokens. Le coût de la carte est BORNÉ par
+# construction, il ne se promet plus dans une docstring : à 40 notes comme à 4000, la
+# sortie tient dans ce plafond et annonce ce qu'elle a dû laisser de côté.
+
+
+def _entrants(g):
+    """Nombre de liens ENTRANTS par note. Une note très citée est un point d'entrée réel
+    du vault (un hub), pas un fichier de plus : c'est ce qui mérite d'être montré quand
+    on ne peut pas tout montrer."""
+    counts = {}
+    for rel, d in g["notes"].items():
+        for raw in d["links"]:
+            tgt, _ = vm.resolve(g, raw)
+            if tgt and tgt != rel:
+                counts[tgt] = counts.get(tgt, 0) + 1
+    return counts
+
+
+def _ligne_note(d):
+    """La ligne détaillée d'une note : nom (lignes) [frontmatter] › titres H2 → liens."""
+    line = f"- {d['name']} ({d['lines']}l){_fm_tag(d['frontmatter'])}"
+    h2 = [_short(h["title"]) for h in d["headings"] if h["level"] == 2]
+    if h2:
+        shown = " · ".join(h2[:6])
+        if len(h2) > 6:
+            shown += f" · (+{len(h2) - 6})"
+        line += "  ›  " + shown
+    if d["links"]:
+        line += "  →  " + " ".join(f"[[{x}]]" for x in d["links"][:6])
+    return line
+
+
+def _tenir_budget(items, budget, poids, reserve=0):
+    """Garde le début de `items` (déjà trié par importance) qui tient dans `budget`.
+    Rend (gardés, nb_omis). budget=0 -> tout. `reserve` = place gardée pour l'en-tête et
+    la ligne de troncature, pour que le budget borne la sortie ENTIÈRE et pas seulement
+    le corps : une limite qu'on dépasse de 2 % est une limite à laquelle on cesse de
+    croire. Ne coupe JAMAIS en silence : l'appelant doit annoncer le nombre d'omis,
+    sinon une carte tronquée se lit comme complète."""
+    if not budget:
+        return list(items), 0
+    gardes, taille = [], max(0, reserve)
+    for it in items:
+        c = poids(it)
+        if taille + c > budget and gardes:
+            break
+        gardes.append(it)
+        taille += c
+    return gardes, len(items) - len(gardes)
+
+
+def _carte_plate(g, by_folder, label):
+    """La carte détaillée d'origine : une ligne par note, groupée par dossier. Reste la
+    meilleure vue tant qu'elle tient dans le budget — sur les docs d'un repo (3 README)
+    ou un petit vault, résumer par dossier ferait perdre l'information utile."""
+    out = [f"# {label} — {_count(len(g['notes']))} ({g['vault']})"]
+    for folder in sorted(by_folder):
+        out.append(f"\n## {folder}")
+        for rel, d in sorted(by_folder[folder]):
+            out.append(_ligne_note(d))
+    return "\n".join(out)
+
+
+def _carte_dossiers(g, by_folder, label, budget):
+    """Vue par défaut : un bloc par dossier (volume + ses notes les plus citées).
+    Coût quasi constant — il dépend du nombre de DOSSIERS, pas du nombre de notes."""
+    ent = _entrants(g)
+    blocs = {}
+    for f, rels in by_folder.items():
+        lignes = sum(d["lines"] for _, d in rels)
+        bloc = [f"\n## {f} — {_notes(len(rels))}, {lignes} l"]
+        hubs = sorted(rels, key=lambda rd: (-ent.get(rd[0], 0), rd[0]))[:3]
+        hubs = [(rel, d) for rel, d in hubs if ent.get(rel)]
+        if hubs:
+            bloc.append("  entrées : " + " · ".join(f"{d['name']}({ent[rel]})" for rel, d in hubs))
+        blocs[f] = "\n".join(bloc)
+
+    # priorité aux gros dossiers si le budget serre (cas d'un repo à 200 sous-dossiers)
+    ordre = sorted(by_folder, key=lambda f: (-len(by_folder[f]), f))
+    entete = len(f"# {label} — {_count(len(g['notes']))} ({g['vault']})") + 140
+    gardes, omis = _tenir_budget(ordre, budget, lambda f: len(blocs[f]) + 1, entete)
+
+    out = [f"# {label} — {_count(len(g['notes']))} ({g['vault']})"]
+    out += [blocs[f] for f in sorted(gardes)]
+    if omis:
+        out.append(f"\n… {omis} dossiers non affichés (budget {budget} car atteint).")
+    out.append('\n→ zoomer : vault_map(folder="…")  ·  chercher un mot : grep_notes("…")')
+    return "\n".join(out)
 
 
 def _enclosing_heading(headings, lineno):
@@ -143,36 +239,69 @@ def index(path: str) -> str:
 
 
 @mcp.tool()
-def vault_map(path: Optional[str] = None) -> str:
-    """Carte d'ensemble du vault : pour chaque note, son dossier PARA, son frontmatter
-    clé (status/score/next_review), ses titres H2 et ses liens sortants. À appeler EN
-    PREMIER pour t'orienter : ~1-2k tokens pour TOUT le vault au lieu d'ouvrir 10 notes.
-    `path` (optionnel) : cartographier un AUTRE dossier pour ce seul appel, sans changer
-    la cible courante. Sur un repo de CODE, rend ses .md (README, docs/, ADR, CHANGELOG)
-    — le « pourquoi » du projet, que repo-map ne voit pas puisqu'il n'indexe que le code."""
+def vault_map(path: Optional[str] = None, folder: Optional[str] = None,
+              budget: int = BUDGET_DEFAUT) -> str:
+    """Carte d'ensemble, à COÛT BORNÉ (elle ne grossit plus avec le vault).
+
+    Sans argument : la carte détaillée (une ligne par note) tant qu'elle tient dans le
+    budget ; au-delà, elle bascule automatiquement en carte des DOSSIERS — volume de
+    chacun + ses notes les plus citées, c'est-à-dire les vrais points d'entrée.
+    `folder="03-Connaissances"` : zoome sur UN dossier — une ligne par note
+    (frontmatter clé, titres H2, liens sortants).
+    `budget` : plafond de la sortie EN CARACTÈRES (défaut 6000 ≈ 1,7k tokens). Ce qui
+    ne rentre pas n'est jamais caché : le nombre de notes omises est annoncé.
+    `budget=0` = tout, sans plafond — audit volontaire, peut coûter très cher.
+    `path` : cartographier un AUTRE dossier pour ce seul appel, sans changer la cible
+    courante. Sur un repo de CODE, rend ses .md (README, docs/, ADR, CHANGELOG) — le
+    « pourquoi » du projet, que repo-map ne voit pas puisqu'il n'indexe que le code.
+
+    Pour CHERCHER quelque chose de précis, ne pas passer par ici : grep_notes(pattern)
+    situe chaque hit dans sa section pour quelques centaines de tokens."""
     g, err = _open(path)
     if err:
         return err
     if not g["notes"]:
         return f"Aucun fichier .md dans {g['vault']}."
+
     by_folder = {}
     for rel, d in g["notes"].items():
         by_folder.setdefault(d["folder"], []).append((rel, d))
     label = "Carte des docs" if g["mode"] == "repo" else "Carte du vault"
-    out = [f"# {label} — {_count(len(g['notes']))} ({g['vault']})"]
-    for folder in sorted(by_folder):
-        out.append(f"\n## {folder}")
-        for rel, d in sorted(by_folder[folder]):
-            h2 = [_short(h["title"]) for h in d["headings"] if h["level"] == 2]
-            line = f"- {d['name']} ({d['lines']}l){_fm_tag(d['frontmatter'])}"
-            if h2:
-                shown = " · ".join(h2[:6])
-                if len(h2) > 6:
-                    shown += f" · (+{len(h2) - 6})"
-                line += "  ›  " + shown
-            if d["links"]:
-                line += "  →  " + " ".join(f"[[{x}]]" for x in d["links"][:6])
-            out.append(line)
+
+    if folder is None:
+        # Tant que le détail tient dans le budget, il vaut mieux que le résumé.
+        plate = _carte_plate(g, by_folder, label)
+        if not budget or len(plate) <= budget:
+            return plate
+        return _carte_dossiers(g, by_folder, label, budget)
+
+    # --- zoom sur un dossier -------------------------------------------------
+    cible = folder.strip().strip("/")
+    noms = sorted(by_folder)
+    exact = [f for f in noms if f.lower() == cible.lower()]
+    proches = exact or [f for f in noms if cible.lower() in f.lower()]
+    if not proches:
+        return (f"Aucun dossier « {folder} » dans {g['vault']}.\n"
+                f"Dossiers : {' · '.join(noms)}")
+    if len(proches) > 1:
+        return f"« {folder} » est ambigu : {' · '.join(proches)}"
+
+    nom = proches[0]
+    rels = by_folder[nom]
+    ent = _entrants(g)
+    lignes = {rel: _ligne_note(d) for rel, d in rels}
+    # sélection par importance (ce qui tombe est le moins cité), affichage alphabétique
+    ordre = sorted(rels, key=lambda rd: (-ent.get(rd[0], 0), rd[0]))
+    total = sum(d["lines"] for _, d in rels)
+    entete = f"# {nom} — {_notes(len(rels))}, {total} l ({g['vault']})"
+    gardes, omis = _tenir_budget(ordre, budget, lambda rd: len(lignes[rd[0]]) + 1,
+                                 len(entete) + 160)
+
+    out = [entete]
+    out += [lignes[rel] for rel, _ in sorted(gardes, key=lambda rd: rd[0])]
+    if omis:
+        out.append(f"\n… {omis} notes non affichées, les moins citées (budget {budget} car "
+                   f"atteint) → cibler avec grep_notes(\"…\"), ou budget=0 pour tout voir.")
     return "\n".join(out)
 
 

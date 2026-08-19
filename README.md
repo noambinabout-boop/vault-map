@@ -21,7 +21,8 @@ instead of answering from memory.
 
 | Tool | What it gives you |
 |---|---|
-| `vault_map()` | whole-vault map: folder, key frontmatter, H2 titles, outgoing links |
+| `vault_map()` | whole-vault map, **cost-bounded**: note-per-line while it fits the budget, folder summary + most-linked notes beyond |
+| `vault_map(folder=…)` | zoom into one folder: key frontmatter, H2 titles, outgoing links per note |
 | `outline(note)` | one note's heading tree with line numbers — call this *before* reading |
 | `get_section(note, title)` | the body of a single section, nothing else |
 | `query(filter)` | filter notes by frontmatter without opening them (`status:draft, score>5`) |
@@ -33,6 +34,13 @@ one call**, without changing the current target (see *Reading a code repo's docs
 
 `query` also understands two pseudo-fields for finding a note by name: `title:<word>` and
 `path:<folder>`.
+
+`vault_map` takes a `budget` (characters, default 6000 ≈ 1.7k tokens). Whatever does not
+fit is **never dropped silently** — the number of omitted notes is stated, with a way to
+reach them (`folder=`, `grep_notes`, or `budget=0` for no cap at all). The point is that
+the cost of the map stops growing with the vault: it was measured at 19k tokens on a
+240-note vault while its own docstring still promised "1-2k". A cost promised in prose
+rots; a cost enforced in code does not.
 
 Freshness is automatic: the map is rebuilt whenever a note changes (signature = aggregated
 mtime + size), so an outline never lies. A stale outline is worse than an honest read.
